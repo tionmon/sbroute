@@ -14,7 +14,6 @@ import (
 
 	D "github.com/miekg/dns"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/tionmon/sbroute/internal/model"
 )
 
 type probeJob struct {
@@ -100,6 +99,8 @@ func (e *Engine) probe(ctx context.Context, n *nodeRuntime, network string, clai
 	start := time.Now()
 	if network == "tcp" {
 		for _, u := range settings.URLs {
+			// Latency covers only the URL that answered, not earlier fallbacks that timed out.
+			start = time.Now()
 			probeCtx, cancel := context.WithTimeout(ctx, time.Duration(settings.Timeout)*time.Second)
 			transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, ForceAttemptHTTP2: false, DialContext: func(c context.Context, netw, addr string) (net.Conn, error) {
 				return out.DialContext(c, "tcp", M.ParseSocksaddr(addr))
@@ -116,8 +117,8 @@ func (e *Engine) probe(ctx context.Context, n *nodeRuntime, network string, clai
 			if err == nil {
 				_, _ = io.CopyN(io.Discard, res.Body, 512)
 				res.Body.Close()
-				if res.StatusCode != 204 {
-					err = fmt.Errorf("probe HTTP status %d (expected 204)", res.StatusCode)
+				if res.StatusCode < 200 || res.StatusCode > 299 {
+					err = fmt.Errorf("probe HTTP status %d (expected 2xx)", res.StatusCode)
 				}
 			}
 			transport.CloseIdleConnections()
@@ -274,6 +275,7 @@ func (e *Engine) maintenance() {
 					}
 				}
 			}
+			removed := false
 			for key, n := range e.nodes {
 				n.mu.Lock()
 				retired := n.retired
@@ -283,11 +285,15 @@ func (e *Engine) maintenance() {
 					n.disposed.Store(true)
 					n.closeIdle(refs != 0)
 					delete(e.nodes, key)
+					removed = true
 					continue
 				}
 				if refs == 0 && time.Now().Unix()-n.lastBusiness.Load() > 600 {
 					n.closeIdle(false)
 				}
+			}
+			if removed {
+				e.publishNodesLocked()
 			}
 			e.mu.Unlock()
 		}
@@ -321,28 +327,9 @@ func (e *Engine) Probe(ctx context.Context, id, network string) error {
 	if network != "tcp" && network != "udp" {
 		return errors.New("network must be tcp or udp")
 	}
-	e.mu.Lock()
-	var n *nodeRuntime
-	for _, def := range e.snap.Load().config.Nodes {
-		if def.ID == id {
-			if def.Disabled {
-				e.mu.Unlock()
-				return errors.New("node disabled")
-			}
-			key := model.Fingerprint(def)
-			n = e.nodes[key]
-			if n == nil {
-				n = &nodeRuntime{engine: e, key: key, definition: def}
-				n.tcp.Store(&HealthState{Status: "unknown"})
-				n.udp.Store(&HealthState{Status: "unknown"})
-				e.nodes[key] = n
-			}
-			break
-		}
-	}
-	e.mu.Unlock()
-	if n == nil {
-		return errors.New("node not found")
+	n, err := e.lookupNode(id)
+	if err != nil {
+		return err
 	}
 	return e.probe(ctx, n, network, true)
 }

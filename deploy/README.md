@@ -22,7 +22,7 @@ sudo journalctl -u sbroute -n 100
 ssh -N -L 8080:127.0.0.1:8080 YOUR_SERVER
 ```
 
-面板默认仅本机访问。如使用反向代理，保留原 Host、启用 HTTPS，并关闭事件流的代理缓冲。初始无管理员时请停服务后运行 `sbroute admin`；离线备份/恢复同样先停服务。
+面板默认仅本机访问。如使用反向代理，保留原 Host、启用 HTTPS，并关闭事件流的代理缓冲；同时在 `ExecStart` 追加 `--trusted-proxy 127.0.0.1`（代理所在地址），让登录限频识别真实客户端 IP。初始无管理员时请停服务后运行 `sbroute admin`；离线备份/恢复同样先停服务。
 
 ## Docker（Linux host network）
 

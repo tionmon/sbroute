@@ -21,14 +21,15 @@ func Handler() http.Handler {
 			name = "index.html"
 		}
 		if _, err := fs.Stat(root, name); err != nil {
-			if strings.HasPrefix(name, "api/") {
+			// Hashed assets must 404 when missing: an HTML fallback breaks stale tabs after an upgrade with a MIME error.
+			if strings.HasPrefix(name, "api/") || strings.HasPrefix(name, "assets/") {
 				http.NotFound(w, r)
 				return
 			}
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/"
 			if _, err = fs.Stat(root, "index.html"); err != nil {
-				http.Error(w, "Web assets missing: run npm ci && npm run build in web/", 503)
+				http.Error(w, "Web assets missing: run npm ci && npm run build in web/", http.StatusServiceUnavailable)
 				return
 			}
 			fileServer.ServeHTTP(w, r2)

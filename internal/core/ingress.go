@@ -62,7 +62,8 @@ func (e *Engine) startGuardedProxy(entry model.Entrance, in adapter.Inbound, sco
 		for {
 			raw, err := ln.Accept()
 			if err != nil {
-				if temporary, ok := err.(net.Error); ok && temporary.Temporary() {
+				// Anything but a closed listener (EMFILE, ENFILE, aborted handshakes) is retried with backoff.
+				if !errors.Is(err, net.ErrClosed) && scope.Context().Err() == nil {
 					if acceptDelay == 0 {
 						acceptDelay = 5 * time.Millisecond
 					} else {

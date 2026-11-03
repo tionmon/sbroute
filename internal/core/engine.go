@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"slices"
 	"sort"
 	"strconv"
@@ -48,6 +49,7 @@ type Engine struct {
 	mu                 sync.Mutex
 	snap               atomic.Pointer[snapshot]
 	nodes              map[string]*nodeRuntime
+	nodeView           atomic.Pointer[map[string]*nodeRuntime]
 	listeners          map[string]*listener
 	event              EventFunc
 	workers            sync.WaitGroup
@@ -75,7 +77,17 @@ type Engine struct {
 type snapshot struct {
 	config model.Config
 	routes map[string]*route
+	// keys caches node ID → runtime fingerprint so status reads do not re-hash every node.
+	keys map[string]string
 }
+
+func (s *snapshot) key(n model.Node) string {
+	if k, ok := s.keys[n.ID]; ok {
+		return k
+	}
+	return model.Fingerprint(n)
+}
+
 type routeCounters struct {
 	active atomic.Int64
 	up     atomic.Int64
@@ -222,7 +234,10 @@ func (e *Engine) Prepare(c model.Config) (func(int64), func(), error) {
 		e.mu.Unlock()
 		return nil, nil, errors.New("engine closing")
 	}
-	next := &snapshot{config: c.Clone(), routes: map[string]*route{}}
+	next := &snapshot{config: c.Clone(), routes: map[string]*route{}, keys: make(map[string]string, len(c.Nodes))}
+	for _, n := range c.Nodes {
+		next.keys[n.ID] = model.Fingerprint(n)
+	}
 	newListeners := map[string]*listener{}
 	newNodes := map[string]*nodeRuntime{}
 	rollback := func() {
@@ -250,7 +265,7 @@ func (e *Engine) Prepare(c model.Config) (func(int64), func(), error) {
 		}
 		seen := map[string]bool{}
 		for _, n := range model.Members(c, group) {
-			key := model.Fingerprint(n)
+			key := next.key(n)
 			if seen[key] {
 				continue
 			}
@@ -332,6 +347,7 @@ func (e *Engine) Prepare(c model.Config) (func(int64), func(), error) {
 			n.mu.Unlock()
 		}
 		e.trimRetiredLocked()
+		e.publishNodesLocked()
 		e.setMemoryBudget(c.Resources.MemoryMiB)
 		e.mu.Unlock()
 		e.signal()
@@ -749,8 +765,17 @@ func (e *Engine) selectReady(ctx context.Context, r *route, network, key string,
 	return n, nil
 }
 func (e *Engine) dial(ctx context.Context, r *route, key, network string, dest M.Socksaddr) (net.Conn, *nodeRuntime, func(), error) {
+	return dialNode(e, ctx, r, key, network, func(out adapter.Outbound) (net.Conn, error) { return out.DialContext(ctx, network, dest) })
+}
+func (e *Engine) dialPacket(ctx context.Context, r *route, key string, dest M.Socksaddr) (net.PacketConn, *nodeRuntime, func(), error) {
+	return dialNode(e, ctx, r, key, "udp", func(out adapter.Outbound) (net.PacketConn, error) { return out.ListenPacket(ctx, dest) })
+}
+
+// dialNode retries up to three distinct healthy nodes; only failures before any payload is committed are retried.
+func dialNode[C any](e *Engine, ctx context.Context, r *route, key, network string, open func(adapter.Outbound) (C, error)) (C, *nodeRuntime, func(), error) {
+	var zero C
 	if !reserve(&e.dials, int64(e.snap.Load().config.Resources.MaxDials)) {
-		return nil, nil, nil, errors.New("dial concurrency exhausted")
+		return zero, nil, nil, errors.New("dial concurrency exhausted")
 	}
 	defer e.dials.Add(-1)
 	excluded := map[*nodeRuntime]bool{}
@@ -758,17 +783,17 @@ func (e *Engine) dial(ctx context.Context, r *route, key, network string, dest M
 	for i := 0; i < 3; i++ {
 		n, err := e.selectReady(ctx, r, network, key, excluded)
 		if err != nil {
-			if last != nil {
-				return nil, nil, nil, last
+			if last == nil {
+				return zero, nil, nil, err
 			}
-			return nil, nil, nil, err
+			break
 		}
 		excluded[n] = true
 		n.pending.Add(1)
 		out, done, err := n.acquire()
 		if err == nil {
-			var c net.Conn
-			c, err = out.DialContext(ctx, network, dest)
+			var c C
+			c, err = open(out)
 			n.pending.Add(-1)
 			if err == nil {
 				return c, n, done, nil
@@ -783,44 +808,7 @@ func (e *Engine) dial(ctx context.Context, r *route, key, network string, dest M
 			break
 		}
 	}
-	return nil, nil, nil, fmt.Errorf("all safe connection attempts failed: %w", last)
-}
-func (e *Engine) dialPacket(ctx context.Context, r *route, key string, dest M.Socksaddr) (net.PacketConn, *nodeRuntime, func(), error) {
-	if !reserve(&e.dials, int64(e.snap.Load().config.Resources.MaxDials)) {
-		return nil, nil, nil, errors.New("dial concurrency exhausted")
-	}
-	defer e.dials.Add(-1)
-	excluded := map[*nodeRuntime]bool{}
-	var last error
-	for i := 0; i < 3; i++ {
-		n, err := e.selectReady(ctx, r, "udp", key, excluded)
-		if err != nil {
-			if last != nil {
-				return nil, nil, nil, last
-			}
-			return nil, nil, nil, err
-		}
-		excluded[n] = true
-		n.pending.Add(1)
-		out, done, err := n.acquire()
-		if err == nil {
-			var c net.PacketConn
-			c, err = out.ListenPacket(ctx, dest)
-			n.pending.Add(-1)
-			if err == nil {
-				return c, n, done, nil
-			}
-			done()
-		} else {
-			n.pending.Add(-1)
-		}
-		last = err
-		e.queueProbe(n, "udp")
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	return nil, nil, nil, last
+	return zero, nil, nil, fmt.Errorf("all safe connection attempts failed: %w", last)
 }
 
 type trackedConn struct {
@@ -850,20 +838,58 @@ func (c *trackedPacketConn) ReaderReplaceable() bool { return true }
 func (c *trackedPacketConn) WriterReplaceable() bool { return true }
 func (c *trackedPacketConn) Upstream() any           { return c.NetPacketConn }
 
-func (e *Engine) Stats() Stats {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	v := Stats{Version: model.Version, CoreVersion: model.CoreVersion, Uptime: int64(time.Since(e.started).Seconds()), Active: e.total.Load(), UDP: e.udp.Load(), Pending: e.dials.Load(), Upload: e.up.Load(), Download: e.down.Load(), Rejected: e.rejected.Load(), RSS: e.rss.Load(), Heap: m.HeapAlloc, Goroutines: runtime.NumGoroutine(), Pressure: e.pressure.Load(), Nodes: []NodeStats{}, Entrances: []EntryStats{}}
+// NodeFilter selects which node rows a status read includes; IDs takes precedence over the page window.
+type NodeFilter struct {
+	IDs    map[string]bool
+	Offset int
+	Limit  int
+}
+
+// UnderPressure reports the memory admission state without collecting full statistics.
+func (e *Engine) UnderPressure() bool { return e.pressure.Load() }
+
+// Stats returns every node row; the management API uses StatsFiltered to page them.
+func (e *Engine) Stats() Stats { return e.StatsFiltered(&NodeFilter{}) }
+
+// StatsFiltered builds status for the selected nodes only; a nil filter omits node rows.
+func (e *Engine) StatsFiltered(filter *NodeFilter) Stats {
+	// runtime/metrics avoids the stop-the-world pause of runtime.ReadMemStats on every panel poll.
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(sample)
+	var heap uint64
+	if sample[0].Value.Kind() == metrics.KindUint64 {
+		heap = sample[0].Value.Uint64()
+	}
+	v := Stats{Version: model.Version, CoreVersion: model.CoreVersion, Uptime: int64(time.Since(e.started).Seconds()), Active: e.total.Load(), UDP: e.udp.Load(), Pending: e.dials.Load(), Upload: e.up.Load(), Download: e.down.Load(), Rejected: e.rejected.Load(), RSS: e.rss.Load(), Heap: heap, Goroutines: runtime.NumGoroutine(), Pressure: e.pressure.Load(), Entrances: []EntryStats{}}
 	v.CgroupUsed = e.groupUsed.Load()
 	v.CgroupLimit = e.groupLimit.Load()
 	v.FDCount = e.fdCount.Load()
 	v.FDLimit = e.fdLimit.Load()
 	s := e.snap.Load()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, n := range s.config.Nodes {
-		key := model.Fingerprint(n)
-		nr := e.nodes[key]
+	var selected []model.Node
+	if filter != nil {
+		v.Nodes = []NodeStats{}
+		switch {
+		case len(filter.IDs) > 0:
+			for _, n := range s.config.Nodes {
+				if filter.IDs[n.ID] {
+					selected = append(selected, n)
+				}
+			}
+		case filter.Limit > 0:
+			offset := max(0, min(filter.Offset, len(s.config.Nodes)))
+			selected = s.config.Nodes[offset:min(offset+filter.Limit, len(s.config.Nodes))]
+		default:
+			selected = s.config.Nodes
+		}
+	}
+	// Status reads use the published node view so they never wait behind a configuration commit.
+	var nodes map[string]*nodeRuntime
+	if view := e.nodeView.Load(); view != nil {
+		nodes = *view
+	}
+	for _, n := range selected {
+		nr := nodes[s.key(n)]
 		ns := NodeStats{ID: n.ID, TCP: HealthState{Status: "inactive"}, UDP: HealthState{Status: "inactive"}}
 		if n.Disabled {
 			ns.TCP.Status = "disabled"
@@ -889,7 +915,7 @@ func (e *Engine) Stats() Stats {
 	for _, r := range s.routes {
 		v.Entrances = append(v.Entrances, EntryStats{ID: r.entry.ID, HealthyTCP: len(r.tcp.Load().nodes), HealthyUDP: len(r.udp.Load().nodes), Active: r.active.Load(), Upload: r.up.Load(), Download: r.down.Load()})
 	}
-	for _, n := range e.nodes {
+	for _, n := range nodes {
 		n.mu.Lock()
 		if !n.retired.IsZero() {
 			v.Draining++
@@ -897,6 +923,15 @@ func (e *Engine) Stats() Stats {
 		n.mu.Unlock()
 	}
 	return v
+}
+
+// publishNodesLocked snapshots e.nodes for lock-free readers; callers hold e.mu after any mutation.
+func (e *Engine) publishNodesLocked() {
+	view := make(map[string]*nodeRuntime, len(e.nodes))
+	for k, n := range e.nodes {
+		view[k] = n
+	}
+	e.nodeView.Store(&view)
 }
 func (e *Engine) setMemoryBudget(mib int) {
 	budget := int64(mib) << 20

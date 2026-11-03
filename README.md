@@ -13,12 +13,13 @@ Linux 单机节点分流器。使用官方 sing-box 1.14.4 协议实现，按入
 - 分享链接、Base64 订阅、Clash YAML、sing-box JSON 节点导入；支持 SOCKS、HTTP、SS、VMess、VLESS、Trojan、AnyTLS、Hysteria2、TUIC。
 - 手动分组与按订阅、关键词、正则的动态分组；手动成员可排序，作为故障转移优先级。
 - TCP/UDP 独立健康状态、共享探测、故障退避、配置版本和回滚；异常订阅更新先审核。
-- SQLite 持久化、完整备份恢复、脱敏导出、实时事件、节点出口 IP 按需查询。
+- SQLite 持久化、完整备份恢复、脱敏导出、实时事件推送、节点出口 IP（含 IPv6）按需查询。
+- 订阅可自定义 User-Agent、经由指定节点下载，并显示服务商返回的已用流量与到期时间。
 - 全局业务计数、重复节点运行时去重、同组调度表共享、连接排空与资源准入保护。
 
 ## 在 Linux 开始使用
 
-解压对应架构的发布包后：
+从 [Releases](https://github.com/tionmon/sbroute/releases) 下载对应架构（amd64 / arm64）的发布包并校验 `SHA256SUMS`，解压后：
 
 ```bash
 chmod +x sbroute
@@ -68,7 +69,7 @@ UDP 使用核心会话边界：固定目标按来源建立会话，SOCKS5 associ
 
 面板切换预设保留当前内存预算和已启动入口的 UDP 超时；其余限制可实时调整。手动修改 UDP 超时、入口认证、入口协议、固定目标或同一地址端口的监听配置，需要先禁用该入口并保存，再修改启用。这样不会在保存失败时丢失旧监听。组成员、调度策略、白名单和节点名称可直接应用。
 
-未被启用入口引用的节点不会自动探测。活跃组闲置 30 分钟后停止周期探测，重新使用时触发候选检查。相同节点/网络共用探测，失败使用备用 HTTPS 地址复核；默认连续失败三轮摘除、连续成功两轮恢复。单个业务目标失败只触发限频复核，不直接判死整个节点。UDP DNS 探测结果不代表任何 UDP 目标都可用。
+未被启用入口引用的节点不会自动探测。活跃组闲置 30 分钟后停止周期探测，重新使用时触发候选检查。相同节点/网络共用探测，失败使用备用 HTTPS 地址复核；探测地址返回任意 2xx 即视为可用，延迟只计算最终成功的那个地址；默认连续失败三轮摘除、连续成功两轮恢复。单个业务目标失败只触发限频复核，不直接判死整个节点。UDP DNS 探测结果不代表任何 UDP 目标都可用。
 
 节点版本更新不修改已有连接使用的对象；旧对象排空后关闭，最长 30 分钟，每个逻辑节点最多保留两个旧版本。协议复用统计的是逻辑业务连接，保留兼容的原配置，不强行开启 multiplex、BBR、Brutal、大缓冲、TFO 或 TLS 0-RTT。
 
@@ -76,11 +77,15 @@ UDP 使用核心会话边界：固定目标按来源建立会话，SOCKS5 associ
 
 ## 订阅与导入边界
 
-订阅默认六小时更新，两个下载任务并发，解码后最多 16MiB；支持服务端 ETag / Last-Modified。仅提取独立节点，不运行 Clash 脚本、规则或代理组。无法转换的字段、协议和插件明确报错；订阅含错误或删除超过原成员一半时保留旧配置并等待审核。空订阅也不会自动清空节点。
+订阅默认六小时更新，两个下载任务并发，解码后最多 16MiB；支持服务端 ETag / Last-Modified。仅提取独立节点，不运行 Clash 脚本、规则或代理组。无法转换的条目会被跳过并在订阅卡片列出原因，其余节点照常更新；只有删除超过原成员一半时才保留旧配置并等待审核，待审核期间仍按周期检查，源恢复正常后自动应用新版本。空订阅也不会自动清空节点。
+
+常见附加参数会按含义处理：`headerType=none`、Reality `spx`、Clash `tfo` / `mptcp` 等对核心客户端无影响的字段直接忽略；Hysteria2 `mport` / Clash `ports` 转为端口跳跃，WebSocket 路径中的 `?ed=N` 转为 early data，Shadowsocks `obfs` / `v2ray-plugin` 使用核心内置实现。启用的 Clash `smux` 等需要服务端配合的选项仍明确报错。
+
+订阅可设置 User-Agent（部分服务商按 UA 返回格式），也可选择“经由某个节点下载”，用于服务器无法直连订阅地址的情况。服务商返回 `subscription-userinfo` 时，面板显示已用流量、总量与到期时间。订阅 URL 仅保存在配置中，元数据只记录其哈希。
 
 同一来源按连接配置指纹保持节点 ID，名称变化不影响绑定；连接参数变化作为新节点。改名和重排不重建相同运行时。动态分组：来源、关键词、正则取交集，与手动成员取并集，最后应用排除规则。
 
-受管节点不支持 `detour`、VPN endpoint、本地文件证书路径或插件；证书可内联。`direct` 仅允许管理员显式配置用于本地测试，不从订阅和批量节点导入自动接纳。没有提供真实公网节点时，协议测试使用本地服务端，不能代替机场线路质量验证。
+受管节点不支持 `detour`、VPN endpoint 或本地文件证书路径；证书可内联。Shadowsocks 插件只接受核心内置的 `obfs-local` 与 `v2ray-plugin`，不会执行外部程序。`direct` 仅允许管理员显式配置用于本地测试，不从订阅和批量节点导入自动接纳。没有提供真实公网节点时，协议测试使用本地服务端，不能代替机场线路质量验证。
 
 ## CLI 与备份
 
@@ -96,7 +101,7 @@ UDP 使用核心会话边界：固定目标按来源建立会话，SOCKS5 associ
 
 离线 CLI 操作使用状态目录互斥锁，需要先停服务；运行期间从面板下载完整备份。备份通过 SQLite `VACUUM INTO` 包含已提交的 WAL 内容，恢复前检查数据库和配置兼容性，并自动备份旧状态。完整备份含凭据；脱敏导出适合检查和同一实例往返，不能用于恢复新机器上的密码。
 
-管理会话有效期 12 小时，退出或重启失效。管理员初始化/重置需要停服务后使用 CLI。远程面板使用 SSH 隧道或 HTTPS 反向代理，不默认开放公网管理端。
+管理会话有效期 12 小时，退出或重启失效。管理员初始化/重置需要停服务后使用 CLI。远程面板使用 SSH 隧道或 HTTPS 反向代理，不默认开放公网管理端。使用反向代理时以 `--trusted-proxy 127.0.0.1`（可逗号分隔多个 IP/CIDR）启动，登录限频才会按 `X-Forwarded-For` 中的真实客户端计数，并根据 `X-Forwarded-Proto` 设置 Secure Cookie；未列入的地址发来的转发头一律忽略。
 
 ## 构建与验证
 
@@ -107,8 +112,11 @@ cd web && npm ci && npm test && npm run build && cd ..
 CGO_ENABLED=0 go build -tags with_quic,with_utls -trimpath -ldflags '-s -w' -o bin/sbroute ./cmd/sbroute
 go test -race -tags with_quic,with_utls ./... -count=1
 go vet -tags with_quic,with_utls ./...
+make lint   # golangci-lint，配置见 .golangci.yml
 go test -tags with_quic,with_utls ./internal/core -run '^$' -bench . -benchmem -count=3
 ```
+
+`make build` 会把 `git describe` 版本号和提交号写入二进制（`sbroute version` 可见）。推送 `v*` 标签时，Release 工作流自动构建 amd64/arm64 发布包、源码包、`SHA256SUMS`，并推送 `ghcr.io/tionmon/sbroute` 多架构镜像。
 
 `scripts/linux-dev.sh` 在项目 `.tools/` 安装并校验指定 Go 工具链，仅用于 Linux amd64 开发；不更改系统 Go。`make` 提供构建、测试和交叉编译入口。
 

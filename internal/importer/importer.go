@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -170,11 +171,28 @@ func fromLink(link string) (map[string]any, error) {
 	}
 	m := map[string]any{"type": kind, "tag": u.Fragment, "server": u.Hostname(), "server_port": port}
 	q := u.Query()
-	allowed := []string{"security", "sni", "peer", "allowInsecure", "insecure", "alpn", "fp", "pbk", "sid", "type", "path", "host", "serviceName", "mode", "flow", "encryption", "packetEncoding", "obfs", "obfs-password", "upmbps", "downmbps", "congestion_control", "udp_relay_mode", "udp_over_stream", "heartbeat", "disable_sni"}
+	allowed := []string{"security", "sni", "peer", "allowInsecure", "insecure", "alpn", "fp", "pbk", "sid", "type", "path", "host", "serviceName", "mode", "flow", "encryption", "packetEncoding", "obfs", "obfs-password", "upmbps", "downmbps", "congestion_control", "udp_relay_mode", "udp_over_stream", "heartbeat", "disable_sni", "mport"}
 	for k := range q {
+		// Parameters that carry no client-side meaning for the core are dropped instead of failing the node.
+		if contains(ignoredLinkParams, k) {
+			continue
+		}
 		if !contains(allowed, k) {
 			return nil, fmt.Errorf("unsupported URL parameter %s", k)
 		}
+	}
+	if h := q.Get("headerType"); h != "" && h != "none" {
+		return nil, errors.New("TCP header obfuscation is not supported")
+	}
+	if q.Get("mport") != "" {
+		if kind != "hysteria2" {
+			return nil, errors.New("mport is only supported for Hysteria2")
+		}
+		ports, err := portRanges(q.Get("mport"))
+		if err != nil {
+			return nil, err
+		}
+		m["server_ports"] = ports
 	}
 	user := ""
 	password := ""
@@ -289,6 +307,52 @@ func contains(v []string, s string) bool {
 	}
 	return false
 }
+
+// ignoredLinkParams have no effect on a core client: spx is a Reality crawler hint, the rest are labels.
+var ignoredLinkParams = []string{"headerType", "spx", "remarks", "remark"}
+
+// portRanges converts "443,20000-30000" into the core's "443:443","20000:30000" form.
+func portRanges(s string) ([]string, error) {
+	var v []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		from, to, found := strings.Cut(part, "-")
+		if !found {
+			to = from
+		}
+		a, e1 := strconv.ParseUint(strings.TrimSpace(from), 10, 16)
+		b, e2 := strconv.ParseUint(strings.TrimSpace(to), 10, 16)
+		if e1 != nil || e2 != nil || a == 0 || a > b {
+			return nil, fmt.Errorf("invalid port range %q", part)
+		}
+		v = append(v, fmt.Sprintf("%d:%d", a, b))
+	}
+	if len(v) == 0 {
+		return nil, errors.New("empty port range")
+	}
+	return v, nil
+}
+
+// splitEarlyData moves the Xray-style "?ed=N" path suffix into WebSocket early-data options.
+func splitEarlyData(path string) (string, int, error) {
+	p, rawQuery, found := strings.Cut(path, "?")
+	if !found {
+		return path, 0, nil
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil || q.Get("ed") == "" {
+		return path, 0, nil
+	}
+	ed, err := strconv.Atoi(q.Get("ed"))
+	if err != nil || ed < 0 {
+		return "", 0, errors.New("invalid WebSocket early data size")
+	}
+	q.Del("ed")
+	if len(q) > 0 {
+		p += "?" + q.Encode()
+	}
+	return p, ed, nil
+}
 func applyTransport(m map[string]any, kind, path, host, service string) error {
 	if kind == "" || kind == "tcp" {
 		return nil
@@ -297,6 +361,17 @@ func applyTransport(m map[string]any, kind, path, host, service string) error {
 	switch kind {
 	case "ws", "httpupgrade":
 		t["path"] = path
+		if kind == "ws" {
+			p, ed, err := splitEarlyData(path)
+			if err != nil {
+				return err
+			}
+			t["path"] = p
+			if ed > 0 {
+				t["max_early_data"] = ed
+				t["early_data_header_name"] = "Sec-WebSocket-Protocol"
+			}
+		}
 		if host != "" {
 			t["headers"] = map[string]any{"Host": host}
 		}
@@ -331,8 +406,19 @@ func ssLink(link string) (map[string]any, error) {
 	if err != nil || u.User == nil {
 		return nil, errors.New("invalid SS link")
 	}
-	if len(u.Query()) > 0 {
-		return nil, errors.New("SS URL plugins/parameters require explicit sing-box JSON")
+	q := u.Query()
+	plugin, pluginOpts := "", ""
+	for k := range q {
+		if k != "plugin" {
+			return nil, fmt.Errorf("unsupported SS URL parameter %s", k)
+		}
+	}
+	if raw := q.Get("plugin"); raw != "" {
+		name, opts, _ := strings.Cut(raw, ";")
+		if plugin, err = ssPlugin(name); err != nil {
+			return nil, err
+		}
+		pluginOpts = opts
 	}
 	method := u.User.Username()
 	password, has := u.User.Password()
@@ -351,8 +437,64 @@ func ssLink(link string) (map[string]any, error) {
 	if u.Hostname() == "" || port < 1 || port > 65535 {
 		return nil, errors.New("invalid SS server")
 	}
-	return map[string]any{"type": "shadowsocks", "tag": u.Fragment, "server": u.Hostname(), "server_port": port, "method": method, "password": password}, nil
+	m := map[string]any{"type": "shadowsocks", "tag": u.Fragment, "server": u.Hostname(), "server_port": port, "method": method, "password": password}
+	if plugin != "" {
+		m["plugin"] = plugin
+		m["plugin_opts"] = pluginOpts
+	}
+	return m, nil
 }
+
+// ssPlugin maps SIP003 plugin names to the core's built-in implementations; external binaries are never run.
+func ssPlugin(name string) (string, error) {
+	switch name {
+	case "obfs-local", "simple-obfs", "obfs":
+		return "obfs-local", nil
+	case "v2ray-plugin":
+		return "v2ray-plugin", nil
+	}
+	return "", fmt.Errorf("unsupported SS plugin %s", name)
+}
+func clashPlugin(name string, raw any) (string, string, error) {
+	plugin, err := ssPlugin(name)
+	if err != nil {
+		return "", "", err
+	}
+	opts, _ := raw.(map[string]any)
+	var parts []string
+	for k, v := range opts {
+		switch {
+		case plugin == "obfs-local" && k == "mode":
+			parts = append(parts, "obfs="+str(v))
+		case plugin == "obfs-local" && k == "host":
+			parts = append(parts, "obfs-host="+str(v))
+		case plugin == "v2ray-plugin" && (k == "mode" || k == "host" || k == "path"):
+			parts = append(parts, k+"="+str(v))
+		case plugin == "v2ray-plugin" && k == "tls":
+			if yes(v) {
+				parts = append(parts, "tls")
+			}
+		case plugin == "v2ray-plugin" && k == "mux":
+			if yes(v) {
+				parts = append(parts, "mux=1")
+			} else {
+				parts = append(parts, "mux=0")
+			}
+		case plugin == "v2ray-plugin" && k == "skip-cert-verify" && !yes(v):
+		default:
+			return "", "", fmt.Errorf("unsupported %s option %s", name, k)
+		}
+	}
+	if plugin == "obfs-local" && !slices.ContainsFunc(parts, func(s string) bool { return strings.HasPrefix(s, "obfs=") }) {
+		return "", "", errors.New("obfs plugin mode required")
+	}
+	slices.Sort(parts)
+	return plugin, strings.Join(parts, ";"), nil
+}
+
+// ignoredClashFields only tune the local dialer or Clash's own UI; the core keeps its defaults.
+var ignoredClashFields = []string{"tfo", "mptcp", "benchmark-url", "benchmark-timeout"}
+
 func vmessLink(encoded string) (map[string]any, error) {
 	b, err := Decode64(encoded)
 	if err != nil {
@@ -404,8 +546,11 @@ func fromClash(c map[string]any) (map[string]any, error) {
 	if kind == "socks5" {
 		kind = "socks"
 	}
-	allowed := []string{"name", "type", "server", "port", "udp", "tls", "servername", "sni", "skip-cert-verify", "alpn", "client-fingerprint", "reality-opts", "network", "ws-opts", "grpc-opts", "http-opts", "h2-opts", "http-upgrade-opts", "uuid", "password", "username", "cipher", "alterId", "flow", "packet-encoding", "obfs", "obfs-password", "up", "down", "congestion-controller", "udp-relay-mode", "udp-over-stream", "heartbeat-interval", "ip-version"}
+	allowed := []string{"name", "type", "server", "port", "udp", "tls", "servername", "sni", "skip-cert-verify", "alpn", "client-fingerprint", "reality-opts", "network", "ws-opts", "grpc-opts", "http-opts", "h2-opts", "http-upgrade-opts", "uuid", "password", "username", "cipher", "alterId", "flow", "packet-encoding", "obfs", "obfs-password", "up", "down", "congestion-controller", "udp-relay-mode", "udp-over-stream", "heartbeat-interval", "ip-version", "plugin", "plugin-opts", "ports", "smux"}
 	for k := range c {
+		if contains(ignoredClashFields, k) {
+			continue
+		}
 		if !contains(allowed, k) {
 			return nil, fmt.Errorf("unsupported Clash field %s; use sing-box JSON for explicit conversion", k)
 		}
@@ -413,7 +558,31 @@ func fromClash(c map[string]any) (map[string]any, error) {
 	if str(c["ip-version"]) != "" {
 		return nil, errors.New("Clash ip-version override requires explicit conversion")
 	}
+	if smux, ok := c["smux"].(map[string]any); ok && yes(smux["enabled"]) {
+		return nil, errors.New("Clash smux requires explicit multiplex conversion")
+	}
 	m := map[string]any{"type": kind, "tag": c["name"], "server": c["server"], "server_port": c["port"]}
+	if c["plugin"] != nil {
+		if kind != "shadowsocks" {
+			return nil, errors.New("plugin is only supported for Shadowsocks")
+		}
+		plugin, opts, err := clashPlugin(str(c["plugin"]), c["plugin-opts"])
+		if err != nil {
+			return nil, err
+		}
+		m["plugin"] = plugin
+		m["plugin_opts"] = opts
+	}
+	if c["ports"] != nil {
+		if kind != "hysteria2" {
+			return nil, errors.New("ports is only supported for Hysteria2")
+		}
+		ports, err := portRanges(str(c["ports"]))
+		if err != nil {
+			return nil, err
+		}
+		m["server_ports"] = ports
+	}
 	for _, key := range []string{"uuid", "password", "username", "flow"} {
 		if v, ok := c[key]; ok {
 			m[key] = v
@@ -500,6 +669,30 @@ func fromClash(c map[string]any) (map[string]any, error) {
 			switch k {
 			case "path":
 				t["path"] = v
+				if network == "ws" {
+					p, ed, err := splitEarlyData(str(v))
+					if err != nil {
+						return nil, err
+					}
+					t["path"] = p
+					if ed > 0 {
+						t["max_early_data"] = ed
+						t["early_data_header_name"] = "Sec-WebSocket-Protocol"
+					}
+				}
+			case "max-early-data":
+				if network == "ws" && intVal(v) > 0 {
+					t["max_early_data"] = intVal(v)
+				}
+			case "early-data-header-name":
+				if network == "ws" && str(v) != "" {
+					t["early_data_header_name"] = v
+				}
+			case "v2ray-http-upgrade":
+				if network == "ws" && yes(v) {
+					t["type"] = "httpupgrade"
+				}
+			case "v2ray-http-upgrade-fast-open":
 			case "headers":
 				t["headers"] = v
 			case "host":
@@ -541,14 +734,7 @@ func Merge(c model.Config, nodes []model.Node, source string, replace bool) (mod
 			}
 			continue
 		}
-		duplicate := false
-		for _, n := range nodes {
-			if old.ID == n.ID {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
+		if !keep[old.ID] {
 			result.Nodes = append(result.Nodes, old)
 		}
 	}

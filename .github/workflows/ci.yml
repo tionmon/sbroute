@@ -1,6 +1,27 @@
 name: checks
-on: workflow_dispatch
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+      # dist is embedded; an empty placeholder is enough for static analysis.
+      - run: mkdir -p internal/web/dist && touch internal/web/dist/.gitkeep
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6.2
   test:
     runs-on: ubuntu-24.04
     steps:
