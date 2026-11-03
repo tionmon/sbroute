@@ -4,7 +4,7 @@ Linux 单机节点分流器。使用官方 sing-box 1.14.4 协议实现，按入
 
 ![SBRoute 控制台](docs/screenshots/dashboard.png)
 
-原有 `sbroute.sh` 保留在仓库中，新版本程序入口为 `cmd/sbroute`。
+程序入口为 `cmd/sbroute`。
 
 ## 能力
 
