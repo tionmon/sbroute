@@ -1,0 +1,15 @@
+SBRoute
+Copyright (C) 2026 SBRoute contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This application embeds sing-box v1.14.4:
+https://github.com/SagerNet/sing-box
+Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
+Licensed under GNU GPL version 3 or, at your option, any later version.
+The upstream notice additionally states that derivative works may not use
+the upstream application's name or imply association without prior consent.
+SBRoute is independently named and is not affiliated with or endorsed by SagerNet.
+
+Other dependencies retain their respective licenses. Exact source versions
+are recorded in go.mod, go.sum and web/package-lock.json. Provide matching
+source and build instructions alongside distributed binaries.

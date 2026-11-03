@@ -1,0 +1,61 @@
+version: 0
+resources:
+  preset: balanced
+  memory_mib: 512
+  max_sessions: 8192
+  max_udp: 2048
+  max_dials: 64
+  probe_concurrency: 4
+  probe_interval_seconds: 120
+  stats_interval_seconds: 2
+  udp_timeout_seconds: 60
+health:
+  urls: ["https://cp.cloudflare.com/", "https://www.gstatic.com/generate_204"]
+  udp_dns: "1.1.1.1:53"
+  timeout_seconds: 5
+  failure_threshold: 3
+  recovery_threshold: 2
+nodes:
+  - id: example-a
+    name: Example SOCKS A
+    disabled: false
+    outbound:
+      type: socks
+      server: 127.0.0.1
+      server_port: 1080
+      version: "5"
+  - id: example-b
+    name: Example SOCKS B
+    disabled: false
+    outbound:
+      type: socks
+      server: 127.0.0.1
+      server_port: 1081
+      version: "5"
+subscriptions: []
+groups:
+  - id: exits
+    name: Example exits
+    members: [example-a, example-b]
+    sources: []
+entrances:
+  - id: proxy-in
+    name: Mixed proxy
+    enabled: false
+    listen: 127.0.0.1
+    port: 10001
+    kind: mixed
+    network: tcp,udp
+    group_id: exits
+    strategy: round_robin
+    allowed_cidrs: [127.0.0.1/32]
+  - id: forward-in
+    name: Fixed target
+    enabled: false
+    listen: 127.0.0.1
+    port: 10002
+    kind: forward
+    network: tcp
+    target: example.com:443
+    group_id: exits
+    strategy: p2c

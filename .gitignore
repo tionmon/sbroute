@@ -1,0 +1,12 @@
+/bin/
+/web/node_modules/
+/internal/web/dist/*
+!/internal/web/dist/.gitkeep
+/data/
+/preview-data/
+/.tools/
+/web/test-results/
+/web/playwright-report/
+*.tar.gz
+*.db*
+*.test

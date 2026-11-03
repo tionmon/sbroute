@@ -1,0 +1,30 @@
+[Unit]
+Description=SBRoute node traffic dispatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sbroute
+Group=sbroute
+StateDirectory=sbroute
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/sbroute
+ExecStart=/usr/local/bin/sbroute serve --data-dir /var/lib/sbroute --listen 127.0.0.1:8080
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+MemoryMax=768M
+TasksMax=512
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+# Disposable UI preview. These SOCKS servers are placeholders, not real exits.
+nodes:
+  - id: demo-hk-a
+    name: 演示 · 香港 A（占位）
+    outbound: {type: socks, server: 127.0.0.1, server_port: 19991, version: "5"}
+  - id: demo-hk-b
+    name: 演示 · 香港 B（占位）
+    outbound: {type: socks, server: 127.0.0.1, server_port: 19992, version: "5"}
+  - id: demo-jp
+    name: 演示 · 日本 A（占位）
+    outbound: {type: socks, server: 127.0.0.1, server_port: 19993, version: "5"}
+groups:
+  - id: demo-hk
+    name: 演示 · 香港组
+    members: [demo-hk-a, demo-hk-b]
+  - id: demo-jp
+    name: 演示 · 日本组
+    members: [demo-jp]
+entrances:
+  - id: demo-mixed
+    name: 代理入口 · 香港
+    enabled: true
+    listen: 127.0.0.1
+    port: 28101
+    kind: mixed
+    network: tcp,udp
+    group_id: demo-hk
+    strategy: round_robin
+  - id: demo-forward
+    name: 固定目标 · 日本
+    enabled: true
+    listen: 127.0.0.1
+    port: 28102
+    kind: forward
+    network: tcp
+    target: example.com:443
+    group_id: demo-jp
+    strategy: p2c
