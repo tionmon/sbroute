@@ -1,0 +1,32 @@
+version: "2"
+run:
+  build-tags: [with_quic, with_utls]
+linters:
+  settings:
+    errcheck:
+      # Closing/rolling back on cleanup paths is best effort throughout the project.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.DB).Close
+        - (*database/sql.Tx).Rollback
+        - (*database/sql.Rows).Close
+        - (*os.File).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (net.PacketConn).Close
+        - (*net.UDPConn).Close
+        - (*net.TCPListener).Close
+        - (*github.com/sagernet/sing-box/adapter.Scope).Close
+        - (*github.com/sagernet/sing-box.Box).Close
+        - (*github.com/tionmon/sbroute/internal/store.Store).Close
+        - (*github.com/tionmon/sbroute/internal/app.Service).Close
+        - (*github.com/tionmon/sbroute/internal/core.Engine).Close
+        - (*github.com/gofrs/flock.Flock).Unlock
+        - os.Remove
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003", "-ST1005", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+  exclusions:
+    rules:
+      # Test fixtures deliberately ignore deadline/write errors on throwaway sockets.
+      - path: _test\.go
+        linters: [errcheck]

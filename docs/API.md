@@ -14,12 +14,12 @@ Base: `/api/v1`，使用 `sbroute_session` HttpOnly / SameSite=Strict cookie。�
 | GET | `/stats?nodes=1&offset=0` | 附带最多 100 个节点状态 |
 | GET | `/stats?nodes=1&ids=a,b` | 按 ID 选择最多 100 个节点 |
 | GET | `/events` | 最近 100 条事件 |
-| GET | `/events/stream` | SSE，最多 8 个并发订阅 |
+| GET | `/events/stream` | SSE，新事件即时推送，15 秒心跳；最多 8 个并发订阅 |
 | POST | `/imports/preview` | `{content,source_id}`，返回脱敏预览和 `preview_id` |
 | POST | `/imports/apply` | `{preview_id,version}`；预览有效期 5 分钟，最多保留 2 份 |
 | POST | `/nodes/{id}/probe` | `{network:"tcp"或"udp"}`，共享并发预算 |
-| POST | `/nodes/{id}/exit-ip` | `{}`，显式访问出口 IP 查询服务 |
-| GET | `/subscriptions/status` | 检查时间、错误和待审核摘要，不解码待审核节点凭据 |
+| POST | `/nodes/{id}/exit-ip` | `{}`，经由节点依次访问多个出口 IP 查询服务（支持 IPv6），失败时返回每个服务的原因 |
+| GET | `/subscriptions/status` | 检查时间、错误、待审核摘要、`skipped` 跳过条目数与 `issues` 原因、`usage`（服务商流量 `upload`/`download`/`total` 字节与 `expire` Unix 时间，可选）；不解码待审核节点凭据 |
 | POST | `/subscriptions/{id}/refresh` | `{}`，手动刷新 |
 | POST | `/subscriptions/{id}/accept` | `{version}`，接受已审核的更新，包括空订阅 |
 | GET | `/revisions` | 最近 20 个配置版本 |
@@ -30,4 +30,4 @@ Base: `/api/v1`，使用 `sbroute_session` HttpOnly / SameSite=Strict cookie。�
 
 版本冲突为 HTTP 409；验证失败为 400；未登录为 401；跨域修改为 403；请求过多为 429。错误体为 `{ "error": "具体原因" }`。新配置先验证和准备资源，失败保留旧配置；成功后版本号递增。监听协议、认证、目标、UDP 超时的同端口修改需先禁用入口并应用，随后再修改启用。
 
-配置 JSON 对应 `internal/model/config.go`。节点 `outbound` 使用核心独立出站格式。脱敏节点携带 `_redacted:true`，提交时按原 ID 保留现有完整出站；改变连接配置应提交完整节点出站。订阅 URL 和密码的 `<redacted>` 同样按 ID/用户名保留。
+配置 JSON 对应 `internal/model/config.go`。订阅对象可选 `user_agent`（≤256 字节可打印字符）与 `via`（下载所经节点 ID，须存在）。节点 `outbound` 使用核心独立出站格式。脱敏节点携带 `_redacted:true`，提交时按原 ID 保留现有完整出站；改变连接配置应提交完整节点出站。订阅 URL 和密码的 `<redacted>` 同样按 ID/用户名保留。

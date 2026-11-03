@@ -15,7 +15,12 @@ import (
 	"strings"
 )
 
-const Version = "0.1.0"
+// Version and Commit are overridden at release build time with -ldflags "-X".
+var (
+	Version = "0.1.0-dev"
+	Commit  = "unknown"
+)
+
 const CoreVersion = "1.14.4"
 const MaxImportBytes = 16 << 20
 
@@ -59,6 +64,10 @@ type Subscription struct {
 	URL      string `json:"url" yaml:"url"`
 	Enabled  bool   `json:"enabled" yaml:"enabled"`
 	Interval int    `json:"interval_seconds" yaml:"interval_seconds"`
+	// UserAgent overrides the default download User-Agent; many providers pick the format by it.
+	UserAgent string `json:"user_agent,omitempty" yaml:"user_agent,omitempty"`
+	// Via downloads through this node instead of connecting directly.
+	Via string `json:"via,omitempty" yaml:"via,omitempty"`
 }
 type Group struct {
 	ID      string   `json:"id" yaml:"id"`
@@ -222,8 +231,13 @@ func (c Config) Validate() error {
 	subIDs := []string{}
 	groupIDs := []string{}
 	entryIDs := []string{}
+	// Sets keep reference checks linear for large node lists.
+	nodeSet := map[string]bool{}
+	subSet := map[string]bool{}
+	groupSet := map[string]bool{}
 	for _, n := range c.Nodes {
 		nodeIDs = append(nodeIDs, n.ID)
+		nodeSet[n.ID] = true
 		if n.Name == "" || len(n.Name) > 256 || n.Outbound == nil {
 			return fmt.Errorf("node %s: name and outbound required", n.ID)
 		}
@@ -233,9 +247,16 @@ func (c Config) Validate() error {
 			return fmt.Errorf("subscription %s: name must be 1–256 bytes", s.ID)
 		}
 		subIDs = append(subIDs, s.ID)
+		subSet[s.ID] = true
 		u, e := url.Parse(s.URL)
 		if e != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || s.Interval < 60 {
 			return fmt.Errorf("subscription %s: valid HTTP(S) URL and interval >=60 required", s.ID)
+		}
+		if len(s.UserAgent) > 256 || strings.ContainsFunc(s.UserAgent, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			return fmt.Errorf("subscription %s: user agent must be at most 256 printable bytes", s.ID)
+		}
+		if s.Via != "" && !nodeSet[s.Via] {
+			return fmt.Errorf("subscription %s: download node %s missing", s.ID, s.Via)
 		}
 	}
 	for _, g := range c.Groups {
@@ -243,18 +264,19 @@ func (c Config) Validate() error {
 			return fmt.Errorf("group %s: invalid name or regex too long", g.ID)
 		}
 		groupIDs = append(groupIDs, g.ID)
+		groupSet[g.ID] = true
 		for _, p := range []string{g.Regex, g.Exclude} {
 			if _, e := regexp.Compile(p); e != nil {
 				return fmt.Errorf("group %s: %w", g.ID, e)
 			}
 		}
 		for _, id := range g.Members {
-			if !slices.Contains(nodeIDs, id) {
+			if !nodeSet[id] {
 				return fmt.Errorf("group %s: missing node %s", g.ID, id)
 			}
 		}
 		for _, id := range g.Sources {
-			if !slices.Contains(subIDs, id) {
+			if !subSet[id] {
 				return fmt.Errorf("group %s: missing subscription %s", g.ID, id)
 			}
 		}
@@ -264,7 +286,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("entrance %s: name must be 1–256 bytes", e.ID)
 		}
 		entryIDs = append(entryIDs, e.ID)
-		if !slices.Contains(groupIDs, e.GroupID) {
+		if !groupSet[e.GroupID] {
 			return fmt.Errorf("entrance %s: group missing", e.ID)
 		}
 		if _, err := netip.ParseAddr(e.Listen); err != nil || e.Port == 0 {

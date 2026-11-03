@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,7 +40,7 @@ func run(args []string) error {
 		args = args[1:]
 	}
 	if command == "version" {
-		fmt.Printf("SBRoute %s · sing-box %s\n", model.Version, model.CoreVersion)
+		fmt.Printf("SBRoute %s (%s) · sing-box %s\n", model.Version, model.Commit, model.CoreVersion)
 		return nil
 	}
 	if command == "help" {
@@ -55,6 +56,7 @@ func run(args []string) error {
 	user := f.String("username", "admin", "administrator username")
 	stdin := f.Bool("password-stdin", false, "read administrator password from stdin")
 	secrets := f.Bool("secrets", false, "include credentials in exported configuration")
+	trusted := f.String("trusted-proxy", "", "comma-separated reverse proxy IPs/CIDRs whose X-Forwarded-For/Proto are trusted (serve)")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -63,6 +65,10 @@ func run(args []string) error {
 	}
 	switch command {
 	case "serve":
+		proxies, err := parsePrefixes(*trusted)
+		if err != nil {
+			return err
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		s, err := app.New(ctx, *dir)
@@ -74,7 +80,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		server := &http.Server{Handler: httpapi.New(s), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+		server := &http.Server{Handler: httpapi.NewWithOptions(s, httpapi.Options{TrustedProxies: proxies}), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 		errs := make(chan error, 1)
 		go func() { errs <- server.Serve(ln) }()
 		fmt.Printf("SBRoute %s · sing-box %s\nManagement: http://%s\nState: %s\n", model.Version, model.CoreVersion, ln.Addr(), *dir)
@@ -247,7 +253,7 @@ func restore(dir, input string) error {
 	if _, err = s.DB.Exec(`ATTACH DATABASE ? AS restored`, input); err != nil {
 		return err
 	}
-	defer s.DB.Exec(`DETACH DATABASE restored`)
+	defer func() { _, _ = s.DB.Exec(`DETACH DATABASE restored`) }()
 	var check string
 	if err = s.DB.QueryRow(`PRAGMA restored.integrity_check`).Scan(&check); err != nil || check != "ok" {
 		return errors.New("backup integrity check failed")
@@ -303,4 +309,29 @@ func restore(dir, input string) error {
 	}
 	fmt.Println("Restored. Previous state:", backup)
 	return nil
+}
+
+// parsePrefixes accepts bare addresses as single-host prefixes.
+func parsePrefixes(value string) ([]netip.Prefix, error) {
+	var v []netip.Prefix
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if !strings.Contains(item, "/") {
+			addr, err := netip.ParseAddr(item)
+			if err != nil {
+				return nil, fmt.Errorf("--trusted-proxy: %w", err)
+			}
+			v = append(v, netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(item)
+		if err != nil {
+			return nil, fmt.Errorf("--trusted-proxy: %w", err)
+		}
+		v = append(v, p.Masked())
+	}
+	return v, nil
 }

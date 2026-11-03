@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -65,6 +66,9 @@ func (e *Engine) decodeNode(ctx context.Context, n model.Node) (option.Outbound,
 	if err := independentFields(n.Outbound); err != nil {
 		return o, err
 	}
+	if err := pluginFields(n.Outbound); err != nil {
+		return o, err
+	}
 	if !slices.Contains([]string{"socks", "http", "shadowsocks", "vmess", "vless", "trojan", "hysteria2", "tuic", "anytls", "direct"}, fmt.Sprint(n.Outbound["type"])) {
 		return o, fmt.Errorf("node %s: unsupported independent outbound type", n.Name)
 	}
@@ -83,13 +87,37 @@ func (e *Engine) decodeNode(ctx context.Context, n model.Node) (option.Outbound,
 }
 func independentFields(m map[string]any) error {
 	for k, v := range m {
-		if slices.Contains([]string{"certificate_path", "client_certificate_path", "client_key_path", "key_path", "config_path", "plugin", "plugin_opts"}, k) && v != nil && v != "" {
+		if slices.Contains([]string{"certificate_path", "client_certificate_path", "client_key_path", "key_path", "config_path"}, k) && v != nil && v != "" {
 			return fmt.Errorf("managed nodes require inline credentials; %s is not supported", k)
 		}
 		if nested, ok := v.(map[string]any); ok {
 			if err := independentFields(nested); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+// pluginFields admits only the core's in-process SIP003 plugins, without certificate file paths.
+func pluginFields(m map[string]any) error {
+	plugin, pluginOK := m["plugin"].(string)
+	opts, optsOK := m["plugin_opts"].(string)
+	if (m["plugin"] != nil && !pluginOK) || (m["plugin_opts"] != nil && !optsOK) {
+		return fmt.Errorf("plugin and plugin_opts must be strings")
+	}
+	if plugin == "" {
+		if opts != "" {
+			return fmt.Errorf("plugin_opts requires plugin")
+		}
+		return nil
+	}
+	if m["type"] != "shadowsocks" || (plugin != "obfs-local" && plugin != "v2ray-plugin") {
+		return fmt.Errorf("only built-in obfs-local and v2ray-plugin are supported for Shadowsocks")
+	}
+	for _, part := range strings.Split(opts, ";") {
+		if key, _, _ := strings.Cut(part, "="); strings.TrimSpace(key) == "cert" {
+			return fmt.Errorf("managed nodes require inline credentials; plugin cert path is not supported")
 		}
 	}
 	return nil

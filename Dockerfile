@@ -11,7 +11,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=web /src/internal/web/dist ./internal/web/dist
-RUN CGO_ENABLED=0 go build -tags with_quic,with_utls -trimpath -ldflags '-s -w' -o /out/sbroute ./cmd/sbroute
+ARG VERSION=dev
+ARG COMMIT=unknown
+RUN CGO_ENABLED=0 go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/tionmon/sbroute/internal/model.Version=${VERSION#v} -X github.com/tionmon/sbroute/internal/model.Commit=$(echo ${COMMIT} | cut -c1-12)" -o /out/sbroute ./cmd/sbroute
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates && addgroup -g 10001 sbroute && adduser -D -u 10001 -G sbroute sbroute && mkdir -p /var/lib/sbroute && chown sbroute:sbroute /var/lib/sbroute

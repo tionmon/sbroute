@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -18,6 +19,8 @@ type Store struct {
 	DB   *sql.DB
 	Path string
 	lock *flock.Flock
+	mu   sync.Mutex
+	subs map[chan Event]struct{}
 }
 type Revision struct {
 	Version int64  `json:"version"`
@@ -163,8 +166,42 @@ type Event struct {
 }
 
 func (s *Store) Event(kind, msg string) {
-	_, _ = s.DB.Exec(`INSERT INTO events(created,kind,message)VALUES(?,?,?)`, time.Now().UTC().Format(time.RFC3339), kind, msg)
+	created := time.Now().UTC().Format(time.RFC3339)
+	r, err := s.DB.Exec(`INSERT INTO events(created,kind,message)VALUES(?,?,?)`, created, kind, msg)
 	_, _ = s.DB.Exec(`DELETE FROM events WHERE id < (SELECT COALESCE(MAX(id),0)-1000 FROM events)`)
+	if err != nil {
+		return
+	}
+	id, err := r.LastInsertId()
+	if err != nil {
+		return
+	}
+	event := Event{ID: id, Created: created, Kind: kind, Message: msg}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ch := range s.subs {
+		// A slow reader misses live pushes; it still gets every event from the database on reconnect.
+		select {
+		case ch <- event:
+		default:
+		}
+	}
+}
+
+// Subscribe delivers events as they are recorded until the returned cancel function is called.
+func (s *Store) Subscribe() (<-chan Event, func()) {
+	ch := make(chan Event, 64)
+	s.mu.Lock()
+	if s.subs == nil {
+		s.subs = map[chan Event]struct{}{}
+	}
+	s.subs[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() {
+		s.mu.Lock()
+		delete(s.subs, ch)
+		s.mu.Unlock()
+	}
 }
 func (s *Store) Events() ([]Event, error) {
 	rows, e := s.DB.Query(`SELECT id,created,kind,message FROM events ORDER BY id DESC LIMIT 100`)

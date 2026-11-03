@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,8 +17,10 @@ import (
 	"time"
 
 	"github.com/tionmon/sbroute/internal/app"
+	"github.com/tionmon/sbroute/internal/core"
 	"github.com/tionmon/sbroute/internal/importer"
 	"github.com/tionmon/sbroute/internal/model"
+	"github.com/tionmon/sbroute/internal/store"
 	assets "github.com/tionmon/sbroute/internal/web"
 	"gopkg.in/yaml.v3"
 )
@@ -36,8 +39,15 @@ type Server struct {
 	streams  chan struct{}
 }
 
-func New(s *app.Service) *Server {
-	v := &Server{service: s, auth: newAuth(s.Store), mux: http.NewServeMux(), previews: map[string]preview{}, streams: make(chan struct{}, 8)}
+// Options configure deployment-specific behaviour of the management API.
+type Options struct {
+	// TrustedProxies are reverse proxies whose X-Forwarded-For / X-Forwarded-Proto headers are believed.
+	TrustedProxies []netip.Prefix
+}
+
+func New(s *app.Service) *Server { return NewWithOptions(s, Options{}) }
+func NewWithOptions(s *app.Service, o Options) *Server {
+	v := &Server{service: s, auth: newAuth(s.Store, o.TrustedProxies), mux: http.NewServeMux(), previews: map[string]preview{}, streams: make(chan struct{}, 8)}
 	v.routes()
 	return v
 }
@@ -178,29 +188,22 @@ func (v *Server) routes() {
 		reply(w, 200, []model.Resources{model.Preset("low-memory"), model.Preset("balanced"), model.Preset("throughput")})
 	})
 	m.HandleFunc("GET /api/v1/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats := v.service.Engine.Stats()
-		if r.URL.Query().Get("nodes") != "1" {
-			stats.Nodes = nil
-		} else if ids := r.URL.Query().Get("ids"); ids != "" {
-			wanted := map[string]bool{}
-			for i, id := range strings.Split(ids, ",") {
-				if i >= 100 {
-					break
+		var filter *core.NodeFilter
+		if r.URL.Query().Get("nodes") == "1" {
+			filter = &core.NodeFilter{Limit: 100}
+			if ids := r.URL.Query().Get("ids"); ids != "" {
+				filter.IDs = map[string]bool{}
+				for i, id := range strings.Split(ids, ",") {
+					if i >= 100 {
+						break
+					}
+					filter.IDs[id] = true
 				}
-				wanted[id] = true
+			} else {
+				filter.Offset, _ = strconv.Atoi(r.URL.Query().Get("offset"))
 			}
-			filtered := stats.Nodes[:0]
-			for _, n := range stats.Nodes {
-				if wanted[n.ID] {
-					filtered = append(filtered, n)
-				}
-			}
-			stats.Nodes = filtered
-		} else {
-			offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-			offset = max(0, min(offset, len(stats.Nodes)))
-			stats.Nodes = stats.Nodes[offset:min(offset+100, len(stats.Nodes))]
 		}
+		stats := v.service.Engine.StatsFiltered(filter)
 		reply(w, 200, stats)
 	})
 	m.HandleFunc("GET /api/v1/events", func(w http.ResponseWriter, r *http.Request) {
@@ -274,7 +277,7 @@ func (v *Server) importPreview(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, e)
 		return
 	}
-	if v.service.Engine.Stats().Pressure {
+	if v.service.Engine.UnderPressure() {
 		fail(w, 429, errors.New("memory pressure: import paused"))
 		return
 	}
@@ -366,30 +369,50 @@ func (v *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	// Subscribe before reading history so nothing recorded in between is lost; IDs de-duplicate the overlap.
+	live, cancel := v.service.Store.Subscribe()
+	defer cancel()
 	last := int64(0)
-	for {
-		events, err := v.service.Store.Events()
-		if err != nil {
+	send := func(e store.Event) bool {
+		if e.ID <= last {
+			return true
+		}
+		b, _ := json.Marshal(e)
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", e.ID, b); err != nil {
+			return false
+		}
+		last = e.ID
+		return true
+	}
+	events, err := v.service.Store.Events()
+	if err != nil {
+		return
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if !send(events[i]) {
 			return
 		}
-		for i := len(events) - 1; i >= 0; i-- {
-			if events[i].ID <= last {
-				continue
-			}
-			b, _ := json.Marshal(events[i])
-			if _, err = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", events[i].ID, b); err != nil {
-				return
-			}
-			last = events[i].ID
-		}
-		_, _ = io.WriteString(w, ": heartbeat\n\n")
-		flusher.Flush()
+	}
+	flusher.Flush()
+	authCheck := time.NewTicker(3 * time.Second)
+	defer authCheck.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-ticker.C:
+		case e := <-live:
+			if !send(e) {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-authCheck.C:
 			if !v.auth.valid(r) {
 				return
 			}
